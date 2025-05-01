@@ -32,12 +32,12 @@ An automated AI-powered code review system for GitLab merge requests. This tool 
 1. Clone this repository
 2. Install dependencies:
    ```
-   npm install
+   pnpm install
    ```
 3. Create a `.env` file with your configuration (see `.env.example`)
 4. Start the application:
    ```
-   npm start
+   pnpm start
    ```
 
 ### Docker Installation
