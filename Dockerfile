@@ -14,12 +14,13 @@ RUN pnpm install --only=production
 # Copy source code
 COPY . .
 
-# Create .env file from environment variables
-RUN echo "GITLAB_URL=${GITLAB_URL}" > .env && \
-    echo "GITLAB_TOKEN=${GITLAB_TOKEN}" >> .env && \
-    echo "EXPECTED_GITLAB_TOKEN=${EXPECTED_GITLAB_TOKEN}" >> .env && \
-    echo "OPENAI_API_KEY=${OPENAI_API_KEY}" >> .env && \
-    echo "AI_MODEL=${AI_MODEL}" >> .env
+# Remove any existing .env files for security
+RUN rm -f .env
+
+# Create a non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN chown -R appuser:appuser /app
+USER appuser
 
 # Expose the port the app runs on
 EXPOSE 3000
