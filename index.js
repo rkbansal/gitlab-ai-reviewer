@@ -29,18 +29,48 @@ const logger = createLogger({
 const app = express();
 app.use(bodyParser.json());
 
-// Initialize AI clients - uncomment the one you're using
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+// Add request timeout middleware
+app.use((req, res, next) => {
+  req.setTimeout(REQUEST_TIMEOUT, () => {
+    logger.error(`Request timeout after ${REQUEST_TIMEOUT}ms`);
+    res.status(408).send('Request Timeout');
+  });
+  next();
 });
 
-// Alternative AI client - Anthropic
-// Uncomment to use Claude models instead
+// Initialize AI clients based on the configured model
+let openai = null;
+let anthropic = null;
 
-const { Anthropic } = require('@anthropic-ai/sdk');
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// Initialize OpenAI client if using GPT models
+if (AI_MODEL.startsWith('gpt')) {
+  if (!process.env.OPENAI_API_KEY) {
+    logger.error('OPENAI_API_KEY is required when using GPT models');
+    process.exit(1);
+  }
+  openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+  });
+  logger.info('OpenAI client initialized');
+}
+
+// Initialize Anthropic client if using Claude models
+if (AI_MODEL.startsWith('claude')) {
+  try {
+    const { Anthropic } = require('@anthropic-ai/sdk');
+    if (!process.env.ANTHROPIC_API_KEY) {
+      logger.error('ANTHROPIC_API_KEY is required when using Claude models');
+      process.exit(1);
+    }
+    anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+    });
+    logger.info('Anthropic client initialized');
+  } catch (error) {
+    logger.error('Failed to initialize Anthropic client. Make sure @anthropic-ai/sdk is installed:', error.message);
+    process.exit(1);
+  }
+}
 
 
 // GitLab configuration
@@ -53,16 +83,24 @@ const AI_MODEL = process.env.AI_MODEL || 'gpt-4';  // Can also use 'claude-3-son
 // Webhook secret token for verification
 const EXPECTED_TOKEN = process.env.EXPECTED_GITLAB_TOKEN;
 
+// Timeout configurations
+const GITLAB_API_TIMEOUT = parseInt(process.env.GITLAB_API_TIMEOUT) || 30000; // 30 seconds
+const AI_API_TIMEOUT = parseInt(process.env.AI_API_TIMEOUT) || 120000; // 2 minutes
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 300000; // 5 minutes for webhook processing
+
+// Create axios instance with timeout for GitLab API calls
+const gitlabAxios = axios.create({
+  timeout: GITLAB_API_TIMEOUT,
+  headers: {
+    'PRIVATE-TOKEN': GITLAB_TOKEN
+  }
+});
+
 // Function to get merge request changes from GitLab
 async function getMergeRequestChanges(projectId, mergeRequestId) {
   try {
-    const response = await axios.get(
-      `${GITLAB_URL}/projects/${projectId}/merge_requests/${mergeRequestId}/changes`,
-      {
-        headers: {
-          'PRIVATE-TOKEN': GITLAB_TOKEN
-        }
-      }
+    const response = await gitlabAxios.get(
+      `${GITLAB_URL}/projects/${projectId}/merge_requests/${mergeRequestId}/changes`
     );
     
     if (response.status === 200) {
@@ -72,7 +110,11 @@ async function getMergeRequestChanges(projectId, mergeRequestId) {
       return [];
     }
   } catch (error) {
-    logger.error('Error fetching merge request changes:', error.message);
+    if (error.code === 'ECONNABORTED') {
+      logger.error(`Timeout fetching merge request changes after ${GITLAB_API_TIMEOUT}ms`);
+    } else {
+      logger.error('Error fetching merge request changes:', error.message);
+    }
     return [];
   }
 }
@@ -80,13 +122,8 @@ async function getMergeRequestChanges(projectId, mergeRequestId) {
 // Function to get merge request details
 async function getMergeRequestDetails(projectId, mergeRequestId) {
   try {
-    const response = await axios.get(
-      `${GITLAB_URL}/projects/${projectId}/merge_requests/${mergeRequestId}`,
-      {
-        headers: {
-          'PRIVATE-TOKEN': GITLAB_TOKEN
-        }
-      }
+    const response = await gitlabAxios.get(
+      `${GITLAB_URL}/projects/${projectId}/merge_requests/${mergeRequestId}`
     );
     
     if (response.status === 200) {
@@ -96,13 +133,21 @@ async function getMergeRequestDetails(projectId, mergeRequestId) {
       return null;
     }
   } catch (error) {
-    logger.error('Error fetching merge request details:', error.message);
+    if (error.code === 'ECONNABORTED') {
+      logger.error(`Timeout fetching merge request details after ${GITLAB_API_TIMEOUT}ms`);
+    } else {
+      logger.error('Error fetching merge request details:', error.message);
+    }
     return null;
   }
 }
 
 // Function to analyze code with OpenAI
 async function analyzeCodeWithOpenAI(codeChanges, mergeRequestDetails) {
+  if (!openai) {
+    throw new Error('OpenAI client not initialized');
+  }
+
   // Create a prompt with the code changes and context
   const prompt = `
   You are an expert code reviewer analyzing a GitLab merge request. 
@@ -133,7 +178,12 @@ async function analyzeCodeWithOpenAI(codeChanges, mergeRequestDetails) {
   `;
 
   try {
-    const response = await openai.chat.completions.create({
+    // Create a timeout promise
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('AI API request timeout')), AI_API_TIMEOUT);
+    });
+
+    const apiPromise = openai.chat.completions.create({
       model: AI_MODEL,
       messages: [
         { role: "system", content: "You are an expert code reviewer who provides helpful, thorough, and actionable feedback." },
@@ -142,18 +192,25 @@ async function analyzeCodeWithOpenAI(codeChanges, mergeRequestDetails) {
       max_tokens: 4000,
       temperature: 0.2,
     });
+
+    const response = await Promise.race([apiPromise, timeoutPromise]);
     
     return response.choices[0].message.content;
   } catch (error) {
-    logger.error('Error analyzing code with AI:', error.message);
+    if (error.message === 'AI API request timeout') {
+      logger.error(`OpenAI API request timeout after ${AI_API_TIMEOUT}ms`);
+    } else {
+      logger.error('Error analyzing code with AI:', error.message);
+    }
     return "Error analyzing code. Please check the logs for more information.";
   }
 }
 
 // Function to analyze code with Anthropic (Claude)
 async function analyzeCodeWithAnthropic(codeChanges, mergeRequestDetails) {
-  // Similar to OpenAI but with Anthropic's API
-  // Would need @anthropic-ai/sdk package
+  if (!anthropic) {
+    throw new Error('Anthropic client not initialized');
+  }
   
   const prompt = `
   You are an expert code reviewer analyzing a GitLab merge request. 
@@ -184,7 +241,12 @@ async function analyzeCodeWithAnthropic(codeChanges, mergeRequestDetails) {
   `;
 
   try {
-    const response = await anthropic.messages.create({
+    // Create a timeout promise
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('AI API request timeout')), AI_API_TIMEOUT);
+    });
+
+    const apiPromise = anthropic.messages.create({
       model: AI_MODEL.startsWith('claude') ? AI_MODEL : 'claude-3-sonnet-20240229',
       max_tokens: 4000,
       temperature: 0.2,
@@ -193,29 +255,30 @@ async function analyzeCodeWithAnthropic(codeChanges, mergeRequestDetails) {
         { role: "user", content: prompt }
       ]
     });
+
+    const response = await Promise.race([apiPromise, timeoutPromise]);
     
     return response.content[0].text;
   } catch (error) {
-    logger.error('Error analyzing code with Claude:', error.message);
+    if (error.message === 'AI API request timeout') {
+      logger.error(`Anthropic API request timeout after ${AI_API_TIMEOUT}ms`);
+    } else {
+      logger.error('Error analyzing code with Claude:', error.message);
+    }
     return "Error analyzing code. Please check the logs for more information.";
   }
-  
-  
-  // Return default message when Anthropic is not configured
-//   return "Anthropic API is not configured.";
 }
 
 // Function to post review comment on merge request
 async function postReviewComment(projectId, mergeRequestId, reviewContent) {
   try {
-    const response = await axios.post(
+    const response = await gitlabAxios.post(
       `${GITLAB_URL}/projects/${projectId}/merge_requests/${mergeRequestId}/notes`,
       {
         body: reviewContent
       },
       {
         headers: {
-          'PRIVATE-TOKEN': GITLAB_TOKEN,
           'Content-Type': 'application/json'
         }
       }
@@ -229,7 +292,11 @@ async function postReviewComment(projectId, mergeRequestId, reviewContent) {
       return false;
     }
   } catch (error) {
-    logger.error('Error posting review comment:', error.message);
+    if (error.code === 'ECONNABORTED') {
+      logger.error(`Timeout posting review comment after ${GITLAB_API_TIMEOUT}ms`);
+    } else {
+      logger.error('Error posting review comment:', error.message);
+    }
     return false;
   }
 }
